@@ -943,3 +943,172 @@ def _ds_from_nwb_object(
     return xr.merge(
         single_keypoint_datasets, join="outer", compat="no_conflicts"
     )
+
+
+def from_mmpose_file(
+    file: str | Path,
+    fps: float | None = None,
+    keypoint_schema: str = "coco_17",
+) -> xr.Dataset:
+    """Create a ``movement`` poses dataset from an MMPose predictions file.
+
+    MMPose saves predictions as a JSON file containing a list of instance
+    objects. Each instance has ``keypoints`` (shape ``K x 3``: x, y,
+    confidence) and ``frame_id`` identifying the video frame.
+
+    Parameters
+    ----------
+    file
+        Path to the MMPose predictions JSON file. The file is expected to
+        contain a list of instance dicts, each with at minimum:
+        ``frame_id`` (int), ``keypoints`` (list of [x, y, score] triplets),
+        and optionally ``track_id`` (int, for multi-individual tracking).
+    fps
+        The number of frames per second in the video. If None (default),
+        the ``time`` coordinates will be in frame numbers.
+    keypoint_schema
+        Keypoint schema name used to assign keypoint names. Currently
+        supported: ``"coco_17"`` (COCO 17-keypoint body pose, default),
+        ``"coco_133"`` (COCO WholeBody), ``"halpe_26"``.
+        Pass a list of strings to use custom keypoint names.
+
+    Returns
+    -------
+    xarray.Dataset
+        ``movement`` dataset containing the pose tracks, confidence scores,
+        and associated metadata.
+
+    Examples
+    --------
+    >>> from movement.io import load_poses
+    >>> ds = load_poses.from_mmpose_file("predictions.json", fps=30)
+
+    """
+    import json
+
+    _KEYPOINT_SCHEMAS: dict[str, list[str]] = {
+        "coco_17": [
+            "nose",
+            "left_eye",
+            "right_eye",
+            "left_ear",
+            "right_ear",
+            "left_shoulder",
+            "right_shoulder",
+            "left_elbow",
+            "right_elbow",
+            "left_wrist",
+            "right_wrist",
+            "left_hip",
+            "right_hip",
+            "left_knee",
+            "right_knee",
+            "left_ankle",
+            "right_ankle",
+        ],
+        "halpe_26": [
+            "nose",
+            "left_eye",
+            "right_eye",
+            "left_ear",
+            "right_ear",
+            "left_shoulder",
+            "right_shoulder",
+            "left_elbow",
+            "right_elbow",
+            "left_wrist",
+            "right_wrist",
+            "left_hip",
+            "right_hip",
+            "left_knee",
+            "right_knee",
+            "left_ankle",
+            "right_ankle",
+            "head",
+            "neck",
+            "hip",
+            "left_big_toe",
+            "right_big_toe",
+            "left_small_toe",
+            "right_small_toe",
+            "left_heel",
+            "right_heel",
+        ],
+    }
+
+    file_path = Path(file)
+    if not file_path.exists():
+        raise FileNotFoundError(f"MMPose predictions file not found: {file_path}")
+    if file_path.suffix.lower() != ".json":
+        raise ValueError(
+            f"Expected a .json file, got '{file_path.suffix}'. "
+            "MMPose predictions should be saved with --out predictions.json."
+        )
+
+    with open(file_path) as f:
+        instances = json.load(f)
+
+    if not isinstance(instances, list) or len(instances) == 0:
+        raise ValueError(
+            f"Expected a non-empty list of instance dicts in {file_path}. "
+            "Check that the file contains MMPose output."
+        )
+
+    # Resolve keypoint names
+    if isinstance(keypoint_schema, list):
+        keypoint_names = keypoint_schema
+    elif keypoint_schema in _KEYPOINT_SCHEMAS:
+        keypoint_names = _KEYPOINT_SCHEMAS[keypoint_schema]
+    else:
+        raise ValueError(
+            f"Unknown keypoint_schema '{keypoint_schema}'. "
+            f"Choose from {list(_KEYPOINT_SCHEMAS.keys())} or pass a list of names."
+        )
+    n_keypoints = len(keypoint_names)
+
+    # Group instances by frame_id
+    frames_dict: dict[int, list[dict]] = {}
+    for inst in instances:
+        fid = int(inst.get("frame_id", inst.get("image_id", 0)))
+        frames_dict.setdefault(fid, []).append(inst)
+
+    sorted_frame_ids = sorted(frames_dict.keys())
+    n_frames = len(sorted_frame_ids)
+
+    # Determine the number of individuals (max instances in any frame)
+    max_individuals = max(len(insts) for insts in frames_dict.values())
+    individual_names = [f"individual_{i}" for i in range(max_individuals)]
+
+    # Arrays: (n_frames, n_space=2, n_keypoints, n_individuals)
+    position_array = np.full(
+        (n_frames, 2, n_keypoints, max_individuals), np.nan, dtype=np.float32
+    )
+    confidence_array = np.full(
+        (n_frames, n_keypoints, max_individuals), np.nan, dtype=np.float32
+    )
+
+    for frame_idx, fid in enumerate(sorted_frame_ids):
+        frame_instances = frames_dict[fid]
+        for ind_idx, inst in enumerate(frame_instances):
+            kps = inst.get("keypoints", [])
+            if not kps:
+                continue
+            kp_array = np.array(kps, dtype=np.float32)
+            # kp_array shape: (K, 3) — x, y, score
+            # Clip to n_keypoints in case schema mismatch
+            k = min(kp_array.shape[0], n_keypoints)
+            position_array[frame_idx, 0, :k, ind_idx] = kp_array[:k, 0]  # x
+            position_array[frame_idx, 1, :k, ind_idx] = kp_array[:k, 1]  # y
+            confidence_array[frame_idx, :k, ind_idx] = kp_array[:k, 2]
+
+    ds = from_numpy(
+        position_array=position_array,
+        confidence_array=confidence_array,
+        individual_names=individual_names,
+        keypoint_names=keypoint_names,
+        fps=fps,
+        source_software="MMPose",
+    )
+    ds.attrs["source_file"] = file_path.as_posix()
+    logger.info(f"Loaded MMPose pose tracks from {file_path}:\n{ds}")
+    return ds
