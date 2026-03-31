@@ -1112,3 +1112,152 @@ def from_mmpose_file(
     ds.attrs["source_file"] = file_path.as_posix()
     logger.info(f"Loaded MMPose pose tracks from {file_path}:\n{ds}")
     return ds
+
+
+def from_coco_file(
+    file: str | Path,
+    fps: float | None = None,
+    keypoint_schema: str = "coco_17",
+) -> xr.Dataset:
+    """Create a ``movement`` poses dataset from a COCO keypoint annotations file.
+
+    COCO stores keypoints in the annotations JSON as a flat list of
+    ``[x1, y1, v1, x2, y2, v2, ...]`` per annotation, where ``v`` is
+    the visibility flag (0 = not labeled, 1 = labeled but occluded,
+    2 = labeled and visible). This loader maps visibility to a
+    confidence score: 0 -> NaN, 1 -> 0.5, 2 -> 1.0.
+
+    Parameters
+    ----------
+    file
+        Path to a COCO-format annotations JSON file. Must contain
+        an ``annotations`` key with a list of annotation dicts, each
+        having ``keypoints`` (flat list), ``image_id`` (int), and
+        optionally ``id`` (annotation id).
+    fps
+        Frames per second. If None, ``time`` coordinates use image
+        indices.
+    keypoint_schema
+        Keypoint schema name or a list of custom names. Supported
+        built-in schemas: ``"coco_17"`` (default).
+
+    Returns
+    -------
+    xarray.Dataset
+        ``movement`` dataset with pose tracks and confidence scores.
+
+    Examples
+    --------
+    >>> from movement.io import load_poses
+    >>> ds = load_poses.from_coco_file("annotations.json", fps=30)
+
+    """
+    import json
+
+    _COCO_SCHEMAS: dict[str, list[str]] = {
+        "coco_17": [
+            "nose",
+            "left_eye",
+            "right_eye",
+            "left_ear",
+            "right_ear",
+            "left_shoulder",
+            "right_shoulder",
+            "left_elbow",
+            "right_elbow",
+            "left_wrist",
+            "right_wrist",
+            "left_hip",
+            "right_hip",
+            "left_knee",
+            "right_knee",
+            "left_ankle",
+            "right_ankle",
+        ],
+    }
+
+    _VISIBILITY_TO_CONFIDENCE = {0: float("nan"), 1: 0.5, 2: 1.0}
+
+    file_path = Path(file)
+    if not file_path.exists():
+        raise FileNotFoundError(
+            f"COCO annotations file not found: {file_path}"
+        )
+    if file_path.suffix.lower() != ".json":
+        raise ValueError(
+            f"Expected a .json file, got '{file_path.suffix}'."
+        )
+
+    with open(file_path) as f:
+        data = json.load(f)
+
+    if not isinstance(data, dict) or "annotations" not in data:
+        raise ValueError(
+            f"Expected a COCO-format JSON with an 'annotations' key "
+            f"in {file_path}."
+        )
+
+    annotations = data["annotations"]
+    if not annotations:
+        raise ValueError(
+            f"No annotations found in {file_path}."
+        )
+
+    # Resolve keypoint names
+    if isinstance(keypoint_schema, list):
+        keypoint_names = keypoint_schema
+    elif keypoint_schema in _COCO_SCHEMAS:
+        keypoint_names = _COCO_SCHEMAS[keypoint_schema]
+    else:
+        raise ValueError(
+            f"Unknown keypoint_schema '{keypoint_schema}'. "
+            f"Choose from {list(_COCO_SCHEMAS.keys())} or pass a list."
+        )
+    n_keypoints = len(keypoint_names)
+
+    # Group annotations by image_id (each image_id is one "frame")
+    frames_dict: dict[int, list[dict]] = {}
+    for ann in annotations:
+        img_id = int(ann.get("image_id", 0))
+        frames_dict.setdefault(img_id, []).append(ann)
+
+    sorted_image_ids = sorted(frames_dict.keys())
+    n_frames = len(sorted_image_ids)
+    max_individuals = max(len(anns) for anns in frames_dict.values())
+    individual_names = [f"individual_{i}" for i in range(max_individuals)]
+
+    position_array = np.full(
+        (n_frames, 2, n_keypoints, max_individuals), np.nan, dtype=np.float32
+    )
+    confidence_array = np.full(
+        (n_frames, n_keypoints, max_individuals), np.nan, dtype=np.float32
+    )
+
+    for frame_idx, img_id in enumerate(sorted_image_ids):
+        for ind_idx, ann in enumerate(frames_dict[img_id]):
+            flat_kps = ann.get("keypoints", [])
+            if not flat_kps:
+                continue
+            # COCO flat format: [x1, y1, v1, x2, y2, v2, ...]
+            n_triplets = min(len(flat_kps) // 3, n_keypoints)
+            for k in range(n_triplets):
+                x = float(flat_kps[k * 3])
+                y = float(flat_kps[k * 3 + 1])
+                v = int(flat_kps[k * 3 + 2])
+                position_array[frame_idx, 0, k, ind_idx] = x
+                position_array[frame_idx, 1, k, ind_idx] = y
+                confidence_array[frame_idx, k, ind_idx] = (
+                    _VISIBILITY_TO_CONFIDENCE.get(v, float("nan"))
+                )
+
+    ds = from_numpy(
+        position_array=position_array,
+        confidence_array=confidence_array,
+        individual_names=individual_names,
+        keypoint_names=keypoint_names,
+        fps=fps,
+        source_software="COCO",
+    )
+    ds.attrs["source_file"] = file_path.as_posix()
+    logger.info(f"Loaded COCO keypoint annotations from {file_path}:\n{ds}")
+    return ds
