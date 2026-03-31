@@ -1261,3 +1261,103 @@ def from_coco_file(
     ds.attrs["source_file"] = file_path.as_posix()
     logger.info(f"Loaded COCO keypoint annotations from {file_path}:\n{ds}")
     return ds
+
+
+def from_freemocap_file(
+    file: str | Path,
+    fps: float | None = None,
+    keypoint_names: list[str] | None = None,
+) -> xr.Dataset:
+    """Create a ``movement`` poses dataset from a FreeMocap output file.
+
+    FreeMocap saves 3D pose data as numpy arrays with shape
+    ``(n_frames, n_keypoints, 3)`` where the last dimension is
+    ``(x, y, z)`` world coordinates from multi-camera triangulation.
+
+    Parameters
+    ----------
+    file
+        Path to a FreeMocap ``.npy`` file containing the 3D pose array.
+    fps
+        Frames per second. If None, time coordinates use frame numbers.
+    keypoint_names
+        List of keypoint names. If None, defaults to the MediaPipe
+        BlazePose 33-keypoint schema used by FreeMocap.
+
+    Returns
+    -------
+    xarray.Dataset
+        ``movement`` dataset with 3D pose tracks (space = x, y, z).
+
+    Examples
+    --------
+    >>> from movement.io import load_poses
+    >>> ds = load_poses.from_freemocap_file("mediapipe_body_3d_xyz.npy", fps=30)
+
+    """
+    _MEDIAPIPE_33 = [
+        "nose", "left_eye_inner", "left_eye", "left_eye_outer",
+        "right_eye_inner", "right_eye", "right_eye_outer",
+        "left_ear", "right_ear", "mouth_left", "mouth_right",
+        "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
+        "left_wrist", "right_wrist", "left_pinky", "right_pinky",
+        "left_index", "right_index", "left_thumb", "right_thumb",
+        "left_hip", "right_hip", "left_knee", "right_knee",
+        "left_ankle", "right_ankle", "left_heel", "right_heel",
+        "left_foot_index", "right_foot_index",
+    ]
+
+    file_path = Path(file)
+    if not file_path.exists():
+        raise FileNotFoundError(
+            f"FreeMocap data file not found: {file_path}"
+        )
+    if file_path.suffix.lower() != ".npy":
+        raise ValueError(
+            f"Expected a .npy file, got '{file_path.suffix}'. "
+            "FreeMocap saves 3D data as numpy .npy files."
+        )
+
+    raw = np.load(file_path)
+
+    if raw.ndim != 3 or raw.shape[2] != 3:
+        raise ValueError(
+            f"Expected array with shape (n_frames, n_keypoints, 3), "
+            f"got shape {raw.shape}."
+        )
+
+    n_frames, n_keypoints, _ = raw.shape
+
+    if keypoint_names is None:
+        if n_keypoints == 33:
+            keypoint_names = _MEDIAPIPE_33
+        else:
+            keypoint_names = [f"keypoint_{i}" for i in range(n_keypoints)]
+    elif len(keypoint_names) != n_keypoints:
+        raise ValueError(
+            f"keypoint_names has {len(keypoint_names)} entries but "
+            f"data has {n_keypoints} keypoints."
+        )
+
+    # Reshape from (frames, keypoints, 3) to (frames, 3, keypoints, 1)
+    # for from_numpy: position_array shape = (time, space, keypoints, individuals)
+    position_array = raw.transpose(0, 2, 1)[:, :, :, np.newaxis].astype(
+        np.float32
+    )
+
+    # FreeMocap does not provide per-keypoint confidence
+    confidence_array = np.ones(
+        (n_frames, n_keypoints, 1), dtype=np.float32
+    )
+
+    ds = from_numpy(
+        position_array=position_array,
+        confidence_array=confidence_array,
+        individual_names=["individual_0"],
+        keypoint_names=keypoint_names,
+        fps=fps,
+        source_software="FreeMocap",
+    )
+    ds.attrs["source_file"] = file_path.as_posix()
+    logger.info(f"Loaded FreeMocap 3D pose data from {file_path}:\n{ds}")
+    return ds
