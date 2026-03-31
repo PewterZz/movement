@@ -1361,3 +1361,148 @@ def from_freemocap_file(
     ds.attrs["source_file"] = file_path.as_posix()
     logger.info(f"Loaded FreeMocap 3D pose data from {file_path}:\n{ds}")
     return ds
+
+
+def from_motion_bids(
+    directory: str | Path,
+    fps: float | None = None,
+    keypoint_names: list[str] | None = None,
+) -> xr.Dataset:
+    """Create a ``movement`` poses dataset from a motion-BIDS directory.
+
+    Motion-BIDS organises tracking data as tab-separated values (TSV)
+    files with accompanying JSON sidecar metadata. The sidecar describes
+    column names, coordinate systems, and sampling frequency.
+
+    This loader traverses a BIDS directory, finds ``*_tracksys-*_motion.tsv``
+    files, reads coordinates from the TSV, and extracts metadata from the
+    JSON sidecar.
+
+    Parameters
+    ----------
+    directory
+        Path to a motion-BIDS directory containing ``*_motion.tsv`` and
+        ``*_motion.json`` sidecar files.
+    fps
+        Frames per second override. If None, uses ``SamplingFrequency``
+        from the JSON sidecar.
+    keypoint_names
+        Override keypoint names. If None, inferred from TSV column headers
+        or sidecar ``TrackedPointsCount`` field.
+
+    Returns
+    -------
+    xarray.Dataset
+        ``movement`` dataset with pose tracks from the BIDS motion data.
+
+    Examples
+    --------
+    >>> from movement.io import load_poses
+    >>> ds = load_poses.from_motion_bids("sub-01/motion/")
+
+    """
+    import csv
+    import json
+
+    dir_path = Path(directory)
+    if not dir_path.is_dir():
+        raise FileNotFoundError(
+            f"motion-BIDS directory not found: {dir_path}"
+        )
+
+    # Find TSV motion files
+    tsv_files = sorted(dir_path.glob("*_motion.tsv"))
+    if not tsv_files:
+        # Try recursive search
+        tsv_files = sorted(dir_path.rglob("*_motion.tsv"))
+    if not tsv_files:
+        raise FileNotFoundError(
+            f"No *_motion.tsv files found in {dir_path}. "
+            "Expected motion-BIDS format with _motion.tsv data files."
+        )
+
+    # Use the first TSV file found
+    tsv_path = tsv_files[0]
+
+    # Look for matching JSON sidecar
+    json_path = tsv_path.with_suffix(".json")
+    sidecar = {}
+    if json_path.exists():
+        with open(json_path) as f:
+            sidecar = json.load(f)
+
+    # Read TSV data
+    with open(tsv_path) as f:
+        reader = csv.reader(f, delimiter="\t")
+        headers = next(reader)
+        rows = [row for row in reader if row]
+
+    if not rows:
+        raise ValueError(f"No data rows found in {tsv_path}.")
+
+    # Parse columns: expect patterns like kp0_x, kp0_y, kp0_z or x0, y0, z0
+    # Determine coordinate columns and keypoint grouping
+    data_array = np.array(rows, dtype=np.float32)
+    n_frames = data_array.shape[0]
+    n_cols = data_array.shape[1]
+
+    # Detect dimensionality (2D or 3D) from column headers
+    has_z = any("_z" in h.lower() or h.lower() == "z" for h in headers)
+    n_space = 3 if has_z else 2
+
+    # Group columns into keypoints
+    n_keypoints = n_cols // n_space
+    if n_keypoints == 0:
+        raise ValueError(
+            f"Cannot determine keypoint layout from {n_cols} columns "
+            f"and {n_space}D coordinates in {tsv_path}."
+        )
+
+    if keypoint_names is None:
+        # Try to extract keypoint names from column headers
+        # Pattern: "keypoint_x" -> "keypoint"
+        extracted = []
+        for h in headers:
+            for suffix in ["_x", "_y", "_z", "_X", "_Y", "_Z"]:
+                if h.endswith(suffix):
+                    name = h[: -len(suffix)]
+                    if name not in extracted:
+                        extracted.append(name)
+                    break
+        if len(extracted) == n_keypoints:
+            keypoint_names = extracted
+        else:
+            keypoint_names = [f"keypoint_{i}" for i in range(n_keypoints)]
+
+    # Reshape: columns are [kp0_x, kp0_y, (kp0_z,) kp1_x, kp1_y, ...]
+    # -> (n_frames, n_space, n_keypoints)
+    position_array = data_array[:, : n_keypoints * n_space].reshape(
+        n_frames, n_keypoints, n_space
+    )
+    # Transpose to (n_frames, n_space, n_keypoints, 1)
+    position_array = position_array.transpose(0, 2, 1)[:, :, :, np.newaxis]
+
+    confidence_array = np.ones(
+        (n_frames, n_keypoints, 1), dtype=np.float32
+    )
+
+    # Use sidecar fps if available
+    if fps is None:
+        fps = sidecar.get("SamplingFrequency", sidecar.get("SamplingFrequencyEffective"))
+
+    ds = from_numpy(
+        position_array=position_array,
+        confidence_array=confidence_array,
+        individual_names=["individual_0"],
+        keypoint_names=keypoint_names,
+        fps=fps,
+        source_software="motionBIDS",
+    )
+    ds.attrs["source_file"] = tsv_path.as_posix()
+    # Attach sidecar metadata
+    for key in ["CoordinateSystem", "CoordinateUnits", "TrackedPointsCount"]:
+        if key in sidecar:
+            ds.attrs[key] = sidecar[key]
+
+    logger.info(f"Loaded motion-BIDS data from {tsv_path}:\n{ds}")
+    return ds
